@@ -24,12 +24,13 @@ logger = logging.getLogger("LiveTradingSystem")
 class LivePaperTradingBot:
     """Real-time trading signal generator - Paper Trading (no real money)"""
     
-    def __init__(self, symbols=None, timeframe="1h", check_interval=3600):
+    def __init__(self, symbols=None, timeframe="1h", check_interval=3600, model_dir="saved_models"):
         """
         Args:
             symbols: List of trading pairs (e.g., ["ETH/USDT", "SOL/USDT"])
             timeframe: Timeframe for signals ("1h", "4h", "1d")
             check_interval: Seconds between signal checks (default 1 hour)
+            model_dir: Directory to save trained models
         """
         self.exchange = ccxt.binance({
             'enableRateLimit': True,
@@ -38,12 +39,16 @@ class LivePaperTradingBot:
         self.symbols = symbols or SYMBOLS
         self.timeframe = timeframe
         self.check_interval = check_interval
+        self.model_dir = model_dir
+        os.makedirs(self.model_dir, exist_ok=True)
+        
         self.models = {}
         self.active_trades = {}
         self.trade_history = []
         
         logger.info(f"🤖 Live Paper Trading Bot Initialized for {len(self.symbols)} symbols")
         logger.info(f"⏰ Check interval: {check_interval}s ({check_interval/3600:.1f}h)")
+        logger.info(f"💾 Models saved to: {self.model_dir}")
     
     def fetch_live_ohlcv(self, symbol, timeframe, limit=100):
         """Fetch real live data from Binance"""
@@ -58,7 +63,7 @@ class LivePaperTradingBot:
             return pd.DataFrame()
     
     def train_models(self, symbol):
-        """Train ensemble models for a symbol"""
+        """Train ensemble models for a symbol and SAVE them"""
         logger.info(f"📊 Training models for {symbol}...")
         
         # Fetch training data (past 200 candles)
@@ -79,14 +84,52 @@ class LivePaperTradingBot:
         suite = CryptoMLEnsembleSuite(
             config_xgb=XGB_PARAMS, 
             config_lgb=LGBM_PARAMS, 
-            config_rf=RF_PARAMS
+            config_rf=RF_PARAMS,
+            model_dir=self.model_dir
         )
         suite.train_classifiers(df_labeled)
         suite.train_regressors(df_labeled)
         
+        # ✅ SAVE THE TRAINED MODELS
+        suite.save_suite(symbol, self.timeframe)
+        model_path = os.path.join(self.model_dir, f"ensemble_{symbol.replace('/', '_')}_{self.timeframe}.pkl")
+        logger.info(f"💾 Models saved to {model_path}")
+        
         self.models[symbol] = {"suite": suite, "last_features": df_features}
-        logger.info(f"✅ Models trained for {symbol}")
+        logger.info(f"✅ Models trained and saved for {symbol}")
         return True
+    
+    def load_models(self, symbol):
+        """Load pre-trained models from disk"""
+        import pickle
+        symbol_clean = symbol.replace("/", "_")
+        model_path = os.path.join(self.model_dir, f"ensemble_{symbol_clean}_{self.timeframe}.pkl")
+        
+        if not os.path.exists(model_path):
+            logger.warning(f"⚠️ No saved model found for {symbol}. Training new model...")
+            return self.train_models(symbol)
+        
+        try:
+            with open(model_path, "rb") as f:
+                data = pickle.load(f)
+            
+            # Reconstruct suite
+            suite = CryptoMLEnsembleSuite(
+                config_xgb=XGB_PARAMS,
+                config_lgb=LGBM_PARAMS,
+                config_rf=RF_PARAMS,
+                model_dir=self.model_dir
+            )
+            suite.classifiers = data["classifiers"]
+            suite.regressors = data["regressors"]
+            suite.trained_features = data["features"]
+            
+            self.models[symbol] = {"suite": suite, "last_features": None}
+            logger.info(f"✅ Loaded saved model for {symbol} from {model_path}")
+            return True
+        except Exception as e:
+            logger.error(f"❌ Failed to load model for {symbol}: {e}")
+            return self.train_models(symbol)
     
     def generate_signal(self, symbol):
         """Generate live trading signal for a symbol"""
@@ -192,6 +235,8 @@ class LivePaperTradingBot:
             "closed_trades": len(self.trade_history) - len(self.active_trades),
             "active_positions": list(self.active_trades.values()),
             "trade_history": self.trade_history,
+            "model_directory": self.model_dir,
+            "saved_models": [f for f in os.listdir(self.model_dir) if f.endswith(".pkl")]
         }
         
         # Calculate stats
@@ -210,9 +255,10 @@ class LivePaperTradingBot:
         start_time = time.time()
         max_duration = duration_hours * 3600
         
-        # Train initial models
+        # Load or train initial models
+        logger.info("📥 Loading models (or training if not found)...")
         for symbol in self.symbols:
-            self.train_models(symbol)
+            self.load_models(symbol)  # ✅ Loads saved models or trains new ones
             time.sleep(0.5)  # Rate limiting
         
         iteration = 0
@@ -262,7 +308,8 @@ if __name__ == "__main__":
     bot = LivePaperTradingBot(
         symbols=["ETH/USDT", "SOL/USDT", "BNB/USDT"],  # Start with 3 symbols
         timeframe="1h",
-        check_interval=3600  # Check every 1 hour (change to 300 for 5 min)
+        check_interval=3600,  # Check every 1 hour (change to 300 for 5 min)
+        model_dir="saved_models"  # ✅ Directory to save trained models
     )
     
     # Run for 24 hours (set to shorter for testing)
